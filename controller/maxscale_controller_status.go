@@ -17,13 +17,13 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
-func (r *MaxScaleReconciler) reconcileStatus(ctx context.Context, req *requestMaxScale) (ctrl.Result, error) {
+func (r *MaxScaleReconciler) reconcileStatus(ctx context.Context, mxs *mariadbv1alpha1.MaxScale) (ctrl.Result, error) {
 	var sts appsv1.StatefulSet
-	if err := r.Get(ctx, client.ObjectKeyFromObject(req.mxs), &sts); err != nil {
+	if err := r.Get(ctx, client.ObjectKeyFromObject(mxs), &sts); err != nil {
 		return ctrl.Result{}, err
 	}
 
-	client, err := r.client(ctx, req.mxs)
+	client, err := r.client(ctx, mxs)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("error getting client: %v", err)
 	}
@@ -35,10 +35,10 @@ func (r *MaxScaleReconciler) reconcileStatus(ctx context.Context, req *requestMa
 		svcStatus, listenerStatus []mariadbv1alpha1.MaxScaleResourceStatus
 	)
 
-	srvStatus, err = r.getServerStatus(ctx, req.mxs, client)
+	srvStatus, err = r.getServerStatus(ctx, mxs, client)
 	errBundle = multierror.Append(errBundle, err)
 
-	currentPrimary := ptr.Deref(req.mxs.Status.PrimaryServer, "")
+	currentPrimary := ptr.Deref(mxs.Status.PrimaryServer, "")
 	newPrimary := ptr.Deref(srvStatus, serverStatus{}).primary
 
 	if currentPrimary != "" && newPrimary != "" && currentPrimary != newPrimary {
@@ -48,27 +48,27 @@ func (r *MaxScaleReconciler) reconcileStatus(ctx context.Context, req *requestMa
 			"to-server", newPrimary,
 		)
 		r.Recorder.Event(
-			req.mxs,
+			mxs,
 			corev1.EventTypeNormal,
 			mariadbv1alpha1.ReasonMaxScalePrimaryServerChanged,
 			fmt.Sprintf("MaxScale primary server changed from '%s' to '%s'", currentPrimary, newPrimary),
 		)
 	}
 
-	monitorStatus, err = r.getMonitorStatus(ctx, req.mxs, client)
+	monitorStatus, err = r.getMonitorStatus(ctx, mxs, client)
 	errBundle = multierror.Append(errBundle, err)
 
-	svcStatus, err = r.getServiceStatus(ctx, req.mxs, client)
+	svcStatus, err = r.getServiceStatus(ctx, mxs, client)
 	errBundle = multierror.Append(errBundle, err)
 
-	listenerStatus, err = r.getListenerStatus(ctx, req.mxs, client)
+	listenerStatus, err = r.getListenerStatus(ctx, mxs, client)
 	errBundle = multierror.Append(errBundle, err)
 
 	if err := errBundle.ErrorOrNil(); err != nil {
 		log.FromContext(ctx).V(1).Info("error getting status", "err", err)
 	}
 
-	return ctrl.Result{}, r.patchStatus(ctx, req.mxs, func(mss *mariadbv1alpha1.MaxScaleStatus) error {
+	return ctrl.Result{}, r.patchStatus(ctx, mxs, func(mss *mariadbv1alpha1.MaxScaleStatus) error {
 		mss.Replicas = sts.Status.ReadyReplicas
 		if srvStatus != nil {
 			if srvStatus.primary != "" {
@@ -89,7 +89,7 @@ func (r *MaxScaleReconciler) reconcileStatus(ctx context.Context, req *requestMa
 		}
 
 		condition.SetReadyWithStatefulSet(mss, &sts)
-		if r.isStatefulSetReady(&sts, req.mxs) {
+		if r.isStatefulSetReady(&sts, mxs) {
 			condition.SetReadyWithMaxScaleStatus(mss, mss)
 		}
 		return nil

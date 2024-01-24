@@ -2,7 +2,6 @@ package controller
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"sort"
 	"time"
@@ -10,7 +9,6 @@ import (
 	"github.com/go-logr/logr"
 	mariadbv1alpha1 "github.com/mariadb-operator/mariadb-operator/api/v1alpha1"
 	ds "github.com/mariadb-operator/mariadb-operator/pkg/datastructures"
-	"github.com/mariadb-operator/mariadb-operator/pkg/health"
 	mdbhttp "github.com/mariadb-operator/mariadb-operator/pkg/http"
 	mxsclient "github.com/mariadb-operator/mariadb-operator/pkg/maxscale/client"
 	"github.com/mariadb-operator/mariadb-operator/pkg/refresolver"
@@ -259,46 +257,6 @@ func listenerAttributes(listener *mariadbv1alpha1.MaxScaleListener) mxsclient.Li
 	}
 }
 
-// MaxScale API - MaxScale
-
-func (m *maxScaleAPI) isMaxScaleConfigSynced(ctx context.Context) (bool, error) {
-	apiLogger(ctx).V(1).Info("Checking MaxScale config sync")
-
-	data, err := m.client.MaxScale.Get(ctx)
-	if err != nil {
-		return false, err
-	}
-	params := data.Attributes.Parameters
-
-	return params.ConfigSyncCluster == m.mxs.Spec.Monitor.Name &&
-		params.ConfigSyncUser == m.mxs.Spec.Auth.SyncUsername &&
-		params.ConfigSyncDB == m.mxs.Spec.Config.Sync.Database, nil
-}
-
-func (m *maxScaleAPI) patchMaxScaleConfigSync(ctx context.Context) error {
-	apiLogger(ctx).V(1).Info("Patching MaxScale config sync")
-
-	if m.mxs.Spec.Config.Sync == nil {
-		return errors.New("'spec.config.sync' must be set")
-	}
-	password, err := m.refResolver.SecretKeyRef(ctx, m.mxs.Spec.Auth.SyncPasswordSecretKeyRef, m.mxs.Namespace)
-	if err != nil {
-		return fmt.Errorf("error getting sync password: %v", err)
-	}
-	attrs := mxsclient.MaxScaleAttributes{
-		Parameters: mxsclient.MaxScaleParameters{
-			ConfigSyncCluster:  m.mxs.Spec.Monitor.Name,
-			ConfigSyncUser:     m.mxs.Spec.Auth.SyncUsername,
-			ConfigSyncPassword: password,
-			ConfigSyncDB:       m.mxs.Spec.Config.Sync.Database,
-			ConfigSyncInterval: m.mxs.Spec.Config.Sync.Interval,
-			ConfigSyncTimeout:  m.mxs.Spec.Config.Sync.Timeout,
-		},
-	}
-
-	return m.client.MaxScale.Patch(ctx, attrs)
-}
-
 // MaxScale client
 
 func (r *MaxScaleReconciler) defaultClientWithPodIndex(ctx context.Context, mxs *mariadbv1alpha1.MaxScale,
@@ -315,14 +273,6 @@ func (r *MaxScaleReconciler) defaultClientWithPodIndex(ctx context.Context, mxs 
 
 func (r *MaxScaleReconciler) client(ctx context.Context, mxs *mariadbv1alpha1.MaxScale) (*mxsclient.Client, error) {
 	return r.clientWithAPIUrl(ctx, mxs, mxs.APIUrl())
-}
-
-func (r *MaxScaleReconciler) clientWitHealthyPod(ctx context.Context, mxs *mariadbv1alpha1.MaxScale) (*mxsclient.Client, error) {
-	podIndex, err := health.HealthyMaxScalePod(ctx, r.Client, mxs)
-	if err != nil {
-		return nil, fmt.Errorf("error getting healthy Pod: %v", err)
-	}
-	return r.clientWithPodIndex(ctx, mxs, *podIndex)
 }
 
 func (r *MaxScaleReconciler) clientWithPodIndex(ctx context.Context, mxs *mariadbv1alpha1.MaxScale,

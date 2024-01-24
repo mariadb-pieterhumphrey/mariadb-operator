@@ -92,33 +92,6 @@ func HealthyMariaDBReplica(ctx context.Context, client client.Client, mariadb *m
 	return nil, ErrNoHealthyInstancesAvailable
 }
 
-func HealthyMaxScalePod(ctx context.Context, client client.Client, maxscale *mariadbv1alpha1.MaxScale) (*int, error) {
-	podList := corev1.PodList{}
-	listOpts := &ctrlclient.ListOptions{
-		LabelSelector: klabels.SelectorFromSet(
-			labels.NewLabelsBuilder().
-				WithMaxScaleSelectorLabels(maxscale).
-				Build(),
-		),
-		Namespace: maxscale.GetNamespace(),
-	}
-	if err := client.List(ctx, &podList, listOpts); err != nil {
-		return nil, fmt.Errorf("error listing Pods: %v", err)
-	}
-	sortPodList(podList)
-
-	for _, p := range podList.Items {
-		index, err := statefulset.PodIndex(p.Name)
-		if err != nil {
-			return nil, fmt.Errorf("error getting index for Pod '%s': %v", p.Name, err)
-		}
-		if pod.PodReady(&p) {
-			return index, nil
-		}
-	}
-	return nil, ErrNoHealthyInstancesAvailable
-}
-
 func IsServiceHealthy(ctx context.Context, client client.Client, serviceKey types.NamespacedName) (bool, error) {
 	var endpoints v1.Endpoints
 	err := client.Get(ctx, serviceKey, &endpoints)

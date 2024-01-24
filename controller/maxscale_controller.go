@@ -56,18 +56,6 @@ type MaxScaleReconciler struct {
 	LogRequests     bool
 }
 
-type requestMaxScale struct {
-	mxs       *mariadbv1alpha1.MaxScale
-	podClient *mxsclient.Client
-}
-
-type reconcileFnMaxScale func(context.Context, *requestMaxScale) (ctrl.Result, error)
-
-type reconcilePhaseMaxScale struct {
-	name      string
-	reconcile reconcileFnMaxScale
-}
-
 //+kubebuilder:rbac:groups=mariadb.mmontes.io,resources=maxscales,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=mariadb.mmontes.io,resources=maxscales/status,verbs=get;update;patch
 //+kubebuilder:rbac:groups=mariadb.mmontes.io,resources=maxscales/finalizers,verbs=update
@@ -81,20 +69,16 @@ type reconcilePhaseMaxScale struct {
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
 func (r *MaxScaleReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	var maxscale mariadbv1alpha1.MaxScale
-	if err := r.Get(ctx, req.NamespacedName, &maxscale); err != nil {
+	var mxs mariadbv1alpha1.MaxScale
+	if err := r.Get(ctx, req.NamespacedName, &mxs); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
-	podClient, err := r.clientWitHealthyPod(ctx, &maxscale)
-	if err != nil {
-		log.FromContext(ctx).V(1).Info("unable to get healthy Pod client", "err", err)
-	}
-	request := &requestMaxScale{
-		mxs:       &maxscale,
-		podClient: podClient,
-	}
+	logger := log.FromContext(ctx)
 
-	phases := []reconcilePhaseMaxScale{
+	phases := []struct {
+		name      string
+		reconcile func(context.Context, *mariadbv1alpha1.MaxScale) (ctrl.Result, error)
+	}{
 		{
 			name:      "Spec",
 			reconcile: r.setSpecDefaults,
@@ -127,18 +111,28 @@ func (r *MaxScaleReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 			name:      "StatefulSet Ready",
 			reconcile: r.ensureStatefulSetReady,
 		},
-		{
-			name:      "Admin",
-			reconcile: r.reconcileAdmin,
-		},
-		{
-			name:      "Init",
-			reconcile: r.reconcileInit,
-		},
-		{
-			name:      "Sync",
-			reconcile: r.reconcileSync,
-		},
+	}
+	for _, p := range phases {
+		logger.V(1).Info("Reconciling phase", "phase", p.name)
+
+		result, err := p.reconcile(ctx, &mxs)
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				continue
+			}
+			if err := r.handleError(ctx, &mxs, err); err != nil {
+				return ctrl.Result{}, fmt.Errorf("error reconciling phase %s: %v", p.name, err)
+			}
+		}
+		if !result.IsZero() {
+			return result, err
+		}
+	}
+
+	perPodPhases := []struct {
+		name      string
+		reconcile func(context.Context, *mariadbv1alpha1.MaxScale, *mxsclient.Client) error
+	}{
 		{
 			name:      "Servers",
 			reconcile: r.reconcileServers,
@@ -148,67 +142,62 @@ func (r *MaxScaleReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 			reconcile: r.reconcileMonitor,
 		},
 		{
-			name:      "Monitor State",
-			reconcile: r.reconcileMonitorState,
-		},
-		{
 			name:      "Services",
 			reconcile: r.reconcileServices,
-		},
-		{
-			name:      "Service State",
-			reconcile: r.reconcileServiceState,
 		},
 		{
 			name:      "Listeners",
 			reconcile: r.reconcileListeners,
 		},
-		{
-			name:      "Listener State",
-			reconcile: r.reconcileListenerState,
-		},
 	}
+	result, err := r.forEachPod(ctx, &mxs, func(podIndex int, podName string, client *mxsclient.Client) (ctrl.Result, error) {
+		if err := r.reconcileAdmin(ctx, &mxs, podIndex, client); err != nil {
+			return ctrl.Result{}, err
+		}
+		for _, p := range perPodPhases {
+			log.FromContext(ctx).V(1).Info("Reconciling Pod phase", "pod", podName, "phase", p.name)
 
-	for _, p := range phases {
-		result, err := p.reconcile(ctx, request)
-		if err != nil {
-			if apierrors.IsNotFound(err) {
-				continue
-			}
-
-			var errBundle *multierror.Error
-			errBundle = multierror.Append(errBundle, err)
-
-			msg := fmt.Sprintf("Error reconciling %s: %v", p.name, err)
-			patchErr := r.patchStatus(ctx, &maxscale, func(s *mariadbv1alpha1.MaxScaleStatus) error {
-				patcher := r.ConditionReady.PatcherFailed(msg)
-				patcher(s)
-				return nil
-			})
-			if apierrors.IsNotFound(patchErr) {
-				errBundle = multierror.Append(errBundle, patchErr)
-			}
-
-			if err := errBundle.ErrorOrNil(); err != nil {
-				return ctrl.Result{}, fmt.Errorf("error reconciling %s: %v", p.name, err)
+			if err := p.reconcile(ctx, &mxs, client); err != nil {
+				if apierrors.IsNotFound(err) {
+					continue
+				}
+				if err := r.handleError(ctx, &mxs, err); err != nil {
+					return ctrl.Result{}, fmt.Errorf("error reconciling phase %s: %v", p.name, err)
+				}
 			}
 		}
-		if !result.IsZero() {
-			return result, err
-		}
+		return ctrl.Result{}, nil
+	})
+	if !result.IsZero() || err != nil {
+		return result, err
 	}
 
-	return r.requeueResult(ctx, &maxscale)
+	return r.requeueResult(ctx, &mxs)
 }
 
-func (r *MaxScaleReconciler) setSpecDefaults(ctx context.Context, req *requestMaxScale) (ctrl.Result, error) {
-	return ctrl.Result{}, r.patch(ctx, req.mxs, func(mxs *mariadbv1alpha1.MaxScale) {
+func (r *MaxScaleReconciler) handleError(ctx context.Context, mxs *mariadbv1alpha1.MaxScale,
+	err error) error {
+	var errBundle *multierror.Error
+	errBundle = multierror.Append(errBundle, err)
+
+	patchErr := r.patchStatus(ctx, mxs, func(s *mariadbv1alpha1.MaxScaleStatus) error {
+		r.ConditionReady.PatcherFailed(err.Error())(s)
+		return nil
+	})
+	if apierrors.IsNotFound(patchErr) {
+		errBundle = multierror.Append(errBundle, patchErr)
+	}
+
+	return errBundle.ErrorOrNil()
+}
+
+func (r *MaxScaleReconciler) setSpecDefaults(ctx context.Context, mxs *mariadbv1alpha1.MaxScale) (ctrl.Result, error) {
+	return ctrl.Result{}, r.patch(ctx, mxs, func(mxs *mariadbv1alpha1.MaxScale) {
 		mxs.SetDefaults(r.Environment)
 	})
 }
 
-func (r *MaxScaleReconciler) reconcileSecret(ctx context.Context, req *requestMaxScale) (ctrl.Result, error) {
-	mxs := req.mxs
+func (r *MaxScaleReconciler) reconcileSecret(ctx context.Context, mxs *mariadbv1alpha1.MaxScale) (ctrl.Result, error) {
 	secretKeyRef := mxs.ConfigSecretKeyRef()
 	config, err := maxscale.Config(mxs)
 	if err != nil {
@@ -255,22 +244,21 @@ func (r *MaxScaleReconciler) reconcileSecret(ctx context.Context, req *requestMa
 	return ctrl.Result{}, nil
 }
 
-func (r *MaxScaleReconciler) reconcileServiceAccount(ctx context.Context, req *requestMaxScale) (ctrl.Result, error) {
-	_, err := r.RBACReconciler.ReconcileServiceAccount(ctx, client.ObjectKeyFromObject(req.mxs), req.mxs, builder.ServiceAccountOpts{})
+func (r *MaxScaleReconciler) reconcileServiceAccount(ctx context.Context, mxs *mariadbv1alpha1.MaxScale) (ctrl.Result, error) {
+	_, err := r.RBACReconciler.ReconcileServiceAccount(ctx, client.ObjectKeyFromObject(mxs), mxs, builder.ServiceAccountOpts{})
 	return ctrl.Result{}, err
 }
 
-func (r *MaxScaleReconciler) reconcileStatefulSet(ctx context.Context, req *requestMaxScale) (ctrl.Result, error) {
-	key := client.ObjectKeyFromObject(req.mxs)
-	desiredSts, err := r.Builder.BuildMaxscaleStatefulSet(req.mxs, key)
+func (r *MaxScaleReconciler) reconcileStatefulSet(ctx context.Context, mxs *mariadbv1alpha1.MaxScale) (ctrl.Result, error) {
+	key := client.ObjectKeyFromObject(mxs)
+	desiredSts, err := r.Builder.BuildMaxscaleStatefulSet(mxs, key)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("error building StatefulSet: %v", err)
 	}
 	return ctrl.Result{}, r.StatefulSetReconciler.Reconcile(ctx, desiredSts)
 }
 
-func (r *MaxScaleReconciler) reconcilePodDisruptionBudget(ctx context.Context, req *requestMaxScale) (ctrl.Result, error) {
-	mxs := req.mxs
+func (r *MaxScaleReconciler) reconcilePodDisruptionBudget(ctx context.Context, mxs *mariadbv1alpha1.MaxScale) (ctrl.Result, error) {
 	if mxs.Spec.PodDisruptionBudget != nil {
 		return ctrl.Result{}, r.reconcilePDBWithAvailability(
 			ctx,
@@ -316,11 +304,11 @@ func (r *MaxScaleReconciler) reconcilePDBWithAvailability(ctx context.Context, m
 	return r.Create(ctx, pdb)
 }
 
-func (r *MaxScaleReconciler) reconcileService(ctx context.Context, req *requestMaxScale) (ctrl.Result, error) {
-	if err := r.reconcileInternalService(ctx, req.mxs); err != nil {
+func (r *MaxScaleReconciler) reconcileService(ctx context.Context, mxs *mariadbv1alpha1.MaxScale) (ctrl.Result, error) {
+	if err := r.reconcileInternalService(ctx, mxs); err != nil {
 		return ctrl.Result{}, err
 	}
-	return ctrl.Result{}, r.reconcileKubernetesService(ctx, req.mxs)
+	return ctrl.Result{}, r.reconcileKubernetesService(ctx, mxs)
 }
 
 func (r *MaxScaleReconciler) reconcileInternalService(ctx context.Context, maxscale *mariadbv1alpha1.MaxScale) error {
@@ -374,17 +362,23 @@ func (r *MaxScaleReconciler) reconcileKubernetesService(ctx context.Context, max
 	return r.ServiceReconciler.Reconcile(ctx, desiredSvc)
 }
 
-func (r *MaxScaleReconciler) reconcileAdmin(ctx context.Context, req *requestMaxScale) (ctrl.Result, error) {
-	return r.forEachPod(ctx, req.mxs, func(podIndex int, podName string, client *mxsclient.Client) (ctrl.Result, error) {
-		if err := r.reconcileAdminInPod(ctx, req.mxs, podIndex, podName, client); err != nil {
-			return ctrl.Result{}, fmt.Errorf("error reconciling admin in Pod '%s': %v", podName, err)
-		}
+func (r *MaxScaleReconciler) ensureStatefulSetReady(ctx context.Context, mxs *mariadbv1alpha1.MaxScale) (ctrl.Result, error) {
+	var sts appsv1.StatefulSet
+	if err := r.Get(ctx, client.ObjectKeyFromObject(mxs), &sts); err != nil {
+		return ctrl.Result{}, err
+	}
+	if r.isStatefulSetReady(&sts, mxs) {
 		return ctrl.Result{}, nil
-	})
+	}
+	return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
 }
 
-func (r *MaxScaleReconciler) reconcileAdminInPod(ctx context.Context, mxs *mariadbv1alpha1.MaxScale,
-	podIndex int, podName string, client *mxsclient.Client) error {
+func (r *MaxScaleReconciler) isStatefulSetReady(sts *appsv1.StatefulSet, mxs *mariadbv1alpha1.MaxScale) bool {
+	return sts.Status.ReadyReplicas == sts.Status.Replicas && sts.Status.ReadyReplicas == mxs.Spec.Replicas
+}
+
+func (r *MaxScaleReconciler) reconcileAdmin(ctx context.Context, mxs *mariadbv1alpha1.MaxScale,
+	podIndex int, client *mxsclient.Client) error {
 	_, err := client.User.Get(ctx, mxs.Spec.Auth.AdminUsername)
 	if err == nil {
 		return nil
@@ -392,7 +386,6 @@ func (r *MaxScaleReconciler) reconcileAdminInPod(ctx context.Context, mxs *maria
 	if !mxsclient.IsUnautorized(err) && !mxsclient.IsNotFound(err) {
 		return fmt.Errorf("error getting admin user: %v", err)
 	}
-	log.FromContext(ctx).Info("Configuring admin in MaxScale Pod", "pod", podName)
 
 	defaultClient, err := r.defaultClientWithPodIndex(ctx, mxs, podIndex)
 	if err != nil {
@@ -411,99 +404,11 @@ func (r *MaxScaleReconciler) reconcileAdminInPod(ctx context.Context, mxs *maria
 	return nil
 }
 
-func (r *MaxScaleReconciler) reconcileInit(ctx context.Context, req *requestMaxScale) (ctrl.Result, error) {
-	return r.forEachPod(ctx, req.mxs, func(podIndex int, podName string, client *mxsclient.Client) (ctrl.Result, error) {
-		result, err := r.reconcileInitInPod(ctx, req.mxs, podName, client)
-		if err != nil {
-			return ctrl.Result{}, fmt.Errorf("error initializing Pod '%s': %v", podName, err)
-		}
-		return result, nil
-	})
-}
-
-func (r *MaxScaleReconciler) reconcileInitInPod(ctx context.Context, mxs *mariadbv1alpha1.MaxScale,
-	podName string, client *mxsclient.Client) (ctrl.Result, error) {
-	shouldInitialize, err := r.shouldInitialize(ctx, mxs, client)
+func (r *MaxScaleReconciler) reconcileServers(ctx context.Context, mxs *mariadbv1alpha1.MaxScale, client *mxsclient.Client) error {
+	currentIdx := mxs.ServerIndex()
+	previousIdx, err := client.Server.ListIndex(ctx)
 	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("error checking initialization status: %v", err)
-	}
-	if !shouldInitialize {
-		return ctrl.Result{}, nil
-	}
-	log.FromContext(ctx).Info("Initializing MaxScale Pod", "pod", podName)
-
-	req := &requestMaxScale{
-		mxs:       mxs,
-		podClient: client,
-	}
-	reconcileFns := []reconcileFnMaxScale{
-		r.reconcileServers,
-		r.reconcileMonitor,
-	}
-	for _, reconcileFn := range reconcileFns {
-		if result, err := reconcileFn(ctx, req); !result.IsZero() || err != nil {
-			return result, err
-		}
-	}
-	return ctrl.Result{}, nil
-}
-
-func (r *MaxScaleReconciler) shouldInitialize(ctx context.Context, mxs *mariadbv1alpha1.MaxScale,
-	client *mxsclient.Client) (bool, error) {
-	allExist, err := client.Server.AllExists(ctx, mxs.ServerIDs())
-	if err != nil {
-		return false, fmt.Errorf("error checking if all servers exist: %v", err)
-	}
-	if !allExist {
-		return true, nil
-	}
-	allExist, err = client.Monitor.AllExists(ctx, []string{mxs.Spec.Monitor.Name})
-	if err != nil {
-		return false, fmt.Errorf("error checking if monitor exists: %v", err)
-	}
-	if !allExist {
-		return true, nil
-	}
-	return false, nil
-}
-
-func (r *MaxScaleReconciler) reconcileSync(ctx context.Context, req *requestMaxScale) (ctrl.Result, error) {
-	return r.forEachPod(ctx, req.mxs, func(podIndex int, podName string, client *mxsclient.Client) (ctrl.Result, error) {
-		isSynced, err := r.reconcileSyncInPod(ctx, req.mxs, podName, client)
-		if err != nil {
-			return ctrl.Result{}, fmt.Errorf("error reconciling config sync in Pod '%s': %v", podName, err)
-		}
-		if !isSynced {
-			return ctrl.Result{RequeueAfter: req.mxs.Spec.Config.Sync.Interval.Duration}, nil
-		}
-		return ctrl.Result{}, nil
-	})
-}
-
-func (r *MaxScaleReconciler) reconcileSyncInPod(ctx context.Context, mxs *mariadbv1alpha1.MaxScale,
-	podName string, client *mxsclient.Client) (bool, error) {
-	mxsApi := newMaxScaleAPI(mxs, client, r.RefResolver)
-
-	isSynced, err := mxsApi.isMaxScaleConfigSynced(ctx)
-	if err != nil {
-		return false, fmt.Errorf("error checking MaxScale config sync: %v", err)
-	}
-	if isSynced {
-		return true, nil
-	}
-	log.FromContext(ctx).Info("Setting up config sync in MaxScale Pod", "pod", podName)
-
-	return false, mxsApi.patchMaxScaleConfigSync(ctx)
-}
-
-func (r *MaxScaleReconciler) reconcileServers(ctx context.Context, req *requestMaxScale) (ctrl.Result, error) {
-	if req.podClient == nil {
-		return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
-	}
-	currentIdx := req.mxs.ServerIndex()
-	previousIdx, err := req.podClient.Server.ListIndex(ctx)
-	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("error getting server index: %v", err)
+		return fmt.Errorf("error getting server index: %v", err)
 	}
 	diff := ds.Diff[
 		mariadbv1alpha1.MaxScaleServer,
@@ -517,7 +422,7 @@ func (r *MaxScaleReconciler) reconcileServers(ctx context.Context, req *requestM
 		"deleted", diff.Deleted,
 		"rest", diff.Rest,
 	)
-	mxsApi := newMaxScaleAPI(req.mxs, req.podClient, r.RefResolver)
+	mxsApi := newMaxScaleAPI(mxs, client, r.RefResolver)
 
 	for _, id := range diff.Added {
 		srv, err := ds.Get(currentIdx, id)
@@ -526,10 +431,10 @@ func (r *MaxScaleReconciler) reconcileServers(ctx context.Context, req *requestM
 			continue
 		}
 		if err := mxsApi.createServer(ctx, &srv); err != nil {
-			return ctrl.Result{}, fmt.Errorf("error creating server: %v", err)
+			return fmt.Errorf("error creating server: %v", err)
 		}
 		if err := mxsApi.updateServerState(ctx, &srv); err != nil {
-			return ctrl.Result{}, fmt.Errorf("error updating server state: %v", err)
+			return fmt.Errorf("error updating server state: %v", err)
 		}
 	}
 
@@ -540,7 +445,7 @@ func (r *MaxScaleReconciler) reconcileServers(ctx context.Context, req *requestM
 			continue
 		}
 		if err := mxsApi.deleteServer(ctx, srv.ID); err != nil {
-			return ctrl.Result{}, fmt.Errorf("error deleting server: %v", err)
+			return fmt.Errorf("error deleting server: %v", err)
 		}
 	}
 
@@ -551,70 +456,52 @@ func (r *MaxScaleReconciler) reconcileServers(ctx context.Context, req *requestM
 			continue
 		}
 		if err := mxsApi.patchServer(ctx, &srv); err != nil {
-			return ctrl.Result{}, fmt.Errorf("error patching server: %v", err)
+			return fmt.Errorf("error patching server: %v", err)
 		}
 		if err := mxsApi.updateServerState(ctx, &srv); err != nil {
-			return ctrl.Result{}, fmt.Errorf("error updating server state: %v", err)
+			return fmt.Errorf("error updating server state: %v", err)
 		}
 	}
-	return ctrl.Result{}, nil
+	return nil
 }
 
-func (r *MaxScaleReconciler) reconcileMonitor(ctx context.Context, req *requestMaxScale) (ctrl.Result, error) {
-	if req.podClient == nil {
-		return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
-	}
-	mxsApi := newMaxScaleAPI(req.mxs, req.podClient, r.RefResolver)
+func (r *MaxScaleReconciler) reconcileMonitor(ctx context.Context, mxs *mariadbv1alpha1.MaxScale, client *mxsclient.Client) error {
+	mxsApi := newMaxScaleAPI(mxs, client, r.RefResolver)
 
-	_, err := req.podClient.Monitor.Get(ctx, req.mxs.Spec.Monitor.Name)
+	_, err := client.Monitor.Get(ctx, mxs.Spec.Monitor.Name)
 	if err != nil {
 		if !mxsclient.IsNotFound(err) {
-			return ctrl.Result{}, fmt.Errorf("error getting monitor: %v", err)
+			return fmt.Errorf("error getting monitor: %v", err)
 		}
 
 		rels, err := mxsApi.serverRelationships(ctx)
 		if err != nil {
-			return ctrl.Result{}, fmt.Errorf("error getting server relationships: %v", err)
+			return fmt.Errorf("error getting server relationships: %v", err)
 		}
 		if err := mxsApi.createMonitor(ctx, rels); err != nil {
-			return ctrl.Result{}, fmt.Errorf("error creating monitor: %v", err)
+			return fmt.Errorf("error creating monitor: %v", err)
 		}
 	} else {
 		rels, err := mxsApi.serverRelationships(ctx)
 		if err != nil {
-			return ctrl.Result{}, fmt.Errorf("error getting server relationships: %v", err)
+			return fmt.Errorf("error getting server relationships: %v", err)
 		}
 		if err := mxsApi.patchMonitor(ctx, rels); err != nil {
-			return ctrl.Result{}, fmt.Errorf("error patching monitor: %v", err)
+			return fmt.Errorf("error patching monitor: %v", err)
 		}
 	}
+	if err := mxsApi.updateMonitorState(ctx); err != nil {
+		return fmt.Errorf("error updating monitor state: %v", err)
+	}
 
-	return ctrl.Result{}, nil
+	return nil
 }
 
-func (r *MaxScaleReconciler) reconcileMonitorState(ctx context.Context, req *requestMaxScale) (ctrl.Result, error) {
-	if !r.SuspendEnabled {
-		return ctrl.Result{}, nil
-	}
-	// MaxScale config sync does not handle object state, we need to update all Pods.
-	return r.forEachPod(ctx, req.mxs, func(podIndex int, podName string, client *mxsclient.Client) (ctrl.Result, error) {
-		mxsApi := newMaxScaleAPI(req.mxs, client, r.RefResolver)
-
-		if err := mxsApi.updateMonitorState(ctx); err != nil {
-			return ctrl.Result{}, fmt.Errorf("error updating monitor state: %v", err)
-		}
-		return ctrl.Result{}, nil
-	})
-}
-
-func (r *MaxScaleReconciler) reconcileServices(ctx context.Context, req *requestMaxScale) (ctrl.Result, error) {
-	if req.podClient == nil {
-		return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
-	}
-	currentIdx := req.mxs.ServiceIndex()
-	previousIdx, err := req.podClient.Service.ListIndex(ctx)
+func (r *MaxScaleReconciler) reconcileServices(ctx context.Context, mxs *mariadbv1alpha1.MaxScale, client *mxsclient.Client) error {
+	currentIdx := mxs.ServiceIndex()
+	previousIdx, err := client.Service.ListIndex(ctx)
 	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("error getting service index: %v", err)
+		return fmt.Errorf("error getting service index: %v", err)
 	}
 	diff := ds.Diff[
 		mariadbv1alpha1.MaxScaleService,
@@ -628,11 +515,11 @@ func (r *MaxScaleReconciler) reconcileServices(ctx context.Context, req *request
 		"deleted", diff.Deleted,
 		"rest", diff.Rest,
 	)
-	mxsApi := newMaxScaleAPI(req.mxs, req.podClient, r.RefResolver)
+	mxsApi := newMaxScaleAPI(mxs, client, r.RefResolver)
 
 	rels, err := mxsApi.serverRelationships(ctx)
 	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("error getting server relationships: %v", err)
+		return fmt.Errorf("error getting server relationships: %v", err)
 	}
 
 	for _, id := range diff.Added {
@@ -642,7 +529,10 @@ func (r *MaxScaleReconciler) reconcileServices(ctx context.Context, req *request
 			continue
 		}
 		if err := mxsApi.createService(ctx, &svc, rels); err != nil {
-			return ctrl.Result{}, fmt.Errorf("error creating service: %v", err)
+			return fmt.Errorf("error creating service: %v", err)
+		}
+		if err := mxsApi.updateServiceState(ctx, &svc); err != nil {
+			return fmt.Errorf("error updating service state: %v", err)
 		}
 	}
 
@@ -653,7 +543,7 @@ func (r *MaxScaleReconciler) reconcileServices(ctx context.Context, req *request
 			continue
 		}
 		if err := mxsApi.deleteService(ctx, svc.ID); err != nil {
-			return ctrl.Result{}, fmt.Errorf("error deleting service: %v", err)
+			return fmt.Errorf("error deleting service: %v", err)
 		}
 	}
 
@@ -664,37 +554,20 @@ func (r *MaxScaleReconciler) reconcileServices(ctx context.Context, req *request
 			continue
 		}
 		if err := mxsApi.patchService(ctx, &svc, rels); err != nil {
-			return ctrl.Result{}, fmt.Errorf("error patching service: %v", err)
+			return fmt.Errorf("error patching service: %v", err)
+		}
+		if err := mxsApi.updateServiceState(ctx, &svc); err != nil {
+			return fmt.Errorf("error updating service state: %v", err)
 		}
 	}
-	return ctrl.Result{}, nil
+	return nil
 }
 
-func (r *MaxScaleReconciler) reconcileServiceState(ctx context.Context, req *requestMaxScale) (ctrl.Result, error) {
-	if !r.SuspendEnabled {
-		return ctrl.Result{}, nil
-	}
-	// MaxScale config sync does not handle object state, we need to update all Pods.
-	return r.forEachPod(ctx, req.mxs, func(podIndex int, podName string, client *mxsclient.Client) (ctrl.Result, error) {
-		mxsApi := newMaxScaleAPI(req.mxs, client, r.RefResolver)
-
-		for _, svc := range req.mxs.Spec.Services {
-			if err := mxsApi.updateServiceState(ctx, &svc); err != nil {
-				return ctrl.Result{}, fmt.Errorf("error updating service state: %v", err)
-			}
-		}
-		return ctrl.Result{}, nil
-	})
-}
-
-func (r *MaxScaleReconciler) reconcileListeners(ctx context.Context, req *requestMaxScale) (ctrl.Result, error) {
-	if req.podClient == nil {
-		return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
-	}
-	currentIdx := req.mxs.ListenerIndex()
-	previousIdx, err := req.podClient.Listener.ListIndex(ctx)
+func (r *MaxScaleReconciler) reconcileListeners(ctx context.Context, mxs *mariadbv1alpha1.MaxScale, client *mxsclient.Client) error {
+	currentIdx := mxs.ListenerIndex()
+	previousIdx, err := client.Listener.ListIndex(ctx)
 	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("error getting listener index: %v", err)
+		return fmt.Errorf("error getting listener index: %v", err)
 	}
 	diff := ds.Diff[
 		mariadbv1alpha1.MaxScaleListener,
@@ -708,7 +581,7 @@ func (r *MaxScaleReconciler) reconcileListeners(ctx context.Context, req *reques
 		"deleted", diff.Deleted,
 		"rest", diff.Rest,
 	)
-	mxsApi := newMaxScaleAPI(req.mxs, req.podClient, r.RefResolver)
+	mxsApi := newMaxScaleAPI(mxs, client, r.RefResolver)
 
 	for _, id := range diff.Added {
 		listener, err := ds.Get(currentIdx, id)
@@ -716,13 +589,16 @@ func (r *MaxScaleReconciler) reconcileListeners(ctx context.Context, req *reques
 			logger.Error(err, "error getting listener to add", "listener", id)
 			continue
 		}
-		svc, err := req.mxs.ServiceForListener(id)
+		svc, err := mxs.ServiceForListener(id)
 		if err != nil {
 			logger.Error(err, "error getting service for listener", "listener", id)
 			continue
 		}
 		if err := mxsApi.createListener(ctx, &listener, mxsApi.serviceRelationships(svc)); err != nil {
-			return ctrl.Result{}, fmt.Errorf("error creating listener: %v", err)
+			return fmt.Errorf("error creating listener: %v", err)
+		}
+		if err := mxsApi.updateListenerState(ctx, &listener); err != nil {
+			return fmt.Errorf("error updating listener state: %v", err)
 		}
 	}
 
@@ -733,7 +609,7 @@ func (r *MaxScaleReconciler) reconcileListeners(ctx context.Context, req *reques
 			continue
 		}
 		if err := mxsApi.deleteListener(ctx, listener.ID); err != nil {
-			return ctrl.Result{}, fmt.Errorf("error ")
+			return fmt.Errorf("error ")
 		}
 	}
 
@@ -743,33 +619,19 @@ func (r *MaxScaleReconciler) reconcileListeners(ctx context.Context, req *reques
 			logger.Error(err, "error getting listener to patch", "listener", id)
 			continue
 		}
-		svc, err := req.mxs.ServiceForListener(id)
+		svc, err := mxs.ServiceForListener(id)
 		if err != nil {
 			logger.Error(err, "error getting service for listener", "listener", id)
 			continue
 		}
 		if err := mxsApi.patchListener(ctx, &listener, mxsApi.serviceRelationships(svc)); err != nil {
-			return ctrl.Result{}, fmt.Errorf("error patching listener: %v", err)
+			return fmt.Errorf("error patching listener: %v", err)
+		}
+		if err := mxsApi.updateListenerState(ctx, &listener); err != nil {
+			return fmt.Errorf("error updating listener state: %v", err)
 		}
 	}
-	return ctrl.Result{}, nil
-}
-
-func (r *MaxScaleReconciler) reconcileListenerState(ctx context.Context, req *requestMaxScale) (ctrl.Result, error) {
-	if !r.SuspendEnabled {
-		return ctrl.Result{}, nil
-	}
-	// MaxScale config sync does not handle object state, we need to update all Pods.
-	return r.forEachPod(ctx, req.mxs, func(podIndex int, podName string, client *mxsclient.Client) (ctrl.Result, error) {
-		mxsApi := newMaxScaleAPI(req.mxs, client, r.RefResolver)
-
-		for _, listener := range req.mxs.Listeners() {
-			if err := mxsApi.updateListenerState(ctx, &listener); err != nil {
-				return ctrl.Result{}, fmt.Errorf("error updating listener state: %v", err)
-			}
-		}
-		return ctrl.Result{}, nil
-	})
+	return nil
 }
 
 func (r *MaxScaleReconciler) forEachPod(ctx context.Context, mxs *mariadbv1alpha1.MaxScale,
@@ -779,7 +641,7 @@ func (r *MaxScaleReconciler) forEachPod(ctx context.Context, mxs *mariadbv1alpha
 		pod := stsobj.PodName(mxs.ObjectMeta, i)
 		client, err := r.clientWithPodIndex(ctx, mxs, i)
 		if err != nil {
-			return ctrl.Result{}, fmt.Errorf("error getting MaxScale client for Pod '%s': %v", pod, err)
+			return ctrl.Result{}, fmt.Errorf("error getting MaxScale client: %v", err)
 		}
 
 		if result, err := fn(i, pod, client); !result.IsZero() || err != nil {
@@ -787,21 +649,6 @@ func (r *MaxScaleReconciler) forEachPod(ctx context.Context, mxs *mariadbv1alpha
 		}
 	}
 	return ctrl.Result{}, nil
-}
-
-func (r *MaxScaleReconciler) ensureStatefulSetReady(ctx context.Context, req *requestMaxScale) (ctrl.Result, error) {
-	var sts appsv1.StatefulSet
-	if err := r.Get(ctx, client.ObjectKeyFromObject(req.mxs), &sts); err != nil {
-		return ctrl.Result{}, err
-	}
-	if r.isStatefulSetReady(&sts, req.mxs) {
-		return ctrl.Result{}, nil
-	}
-	return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
-}
-
-func (r *MaxScaleReconciler) isStatefulSetReady(sts *appsv1.StatefulSet, mxs *mariadbv1alpha1.MaxScale) bool {
-	return sts.Status.ReadyReplicas == sts.Status.Replicas && sts.Status.ReadyReplicas == mxs.Spec.Replicas
 }
 
 func (r *MaxScaleReconciler) patch(ctx context.Context, maxscale *mariadbv1alpha1.MaxScale,
