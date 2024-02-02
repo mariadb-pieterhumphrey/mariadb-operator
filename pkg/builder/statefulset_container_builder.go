@@ -367,7 +367,7 @@ func mariadbLivenessProbe(mariadb *mariadbv1alpha1.MariaDB) *corev1.Probe {
 }
 
 func mariadbReadinessProbe(mariadb *mariadbv1alpha1.MariaDB) *corev1.Probe {
-	return mariadbProbe(mariadb, mariadb.Spec.ReadinessProbe)
+	return nil
 }
 
 func mariadbProbe(mariadb *mariadbv1alpha1.MariaDB, probe *corev1.Probe) *corev1.Probe {
@@ -461,7 +461,7 @@ var (
 		},
 		InitialDelaySeconds: 60,
 		TimeoutSeconds:      5,
-		PeriodSeconds:       10,
+		PeriodSeconds:       30,
 	}
 	defaultAgentProbe = func(galera mariadbv1alpha1.Galera) *corev1.Probe {
 		return &corev1.Probe{

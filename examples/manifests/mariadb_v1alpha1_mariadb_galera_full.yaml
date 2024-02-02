@@ -22,7 +22,7 @@ spec:
     enabled: true
     primary:
       podIndex: 0
-      automaticFailover: true
+      automaticFailover: false
     sst: mariabackup
     replicaThreads: 1
     agent:
@@ -38,7 +38,7 @@ spec:
       podRecoveryTimeout: 5m
       podSyncTimeout: 5m
     initContainer:
-      image: ghcr.io/mariadb-operator/init:v0.0.6
+      image: ghcr.io/mariadb-operator/init:v0.0.13
     volumeClaimTemplate:
       resources:
         requests:
@@ -73,24 +73,24 @@ spec:
     secretTemplate:
       key: dsn
 
-  affinity:
-    podAntiAffinity:
-      requiredDuringSchedulingIgnoredDuringExecution:
-        - labelSelector:
-            matchExpressions:
-              - key: app.kubernetes.io/instance
-                operator: In
-                values:
-                  - mariadb-galera
-          topologyKey: "kubernetes.io/hostname"
+  # affinity:
+  #   podAntiAffinity:
+  #     requiredDuringSchedulingIgnoredDuringExecution:
+  #       - labelSelector:
+  #           matchExpressions:
+  #             - key: app.kubernetes.io/instance
+  #               operator: In
+  #               values:
+  #                 - mariadb-galera
+  #         topologyKey: "kubernetes.io/hostname"
 
-  tolerations:
-    - key: "mariadb.mmontes.io/ha"
-      operator: "Exists"
-      effect: "NoSchedule"
+  # tolerations:
+  #   - key: "mariadb.mmontes.io/ha"
+  #     operator: "Exists"
+  #     effect: "NoSchedule"
 
   podDisruptionBudget:
-    maxUnavailable: 66%
+    maxUnavailable: 33%
 
   updateStrategy:
     type: RollingUpdate
@@ -112,3 +112,11 @@ spec:
 
   metrics:
     enabled: true
+
+  maxScale:
+    enabled: true
+
+    kubernetesService:
+      type: LoadBalancer
+      annotations:
+        metallb.universe.tf/loadBalancerIPs: 172.18.0.229
