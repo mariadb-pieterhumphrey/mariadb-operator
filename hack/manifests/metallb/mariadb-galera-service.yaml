@@ -11,6 +11,12 @@ spec:
     port: 3306
     protocol: TCP
     targetPort: 3306
+  - name: cluster
+    port: 4444
+  - name: ist
+    port: 4567
+  - name: sst
+    port: 4568
   - name: agent
     port: 5555
     protocol: TCP
@@ -35,6 +41,12 @@ spec:
     port: 3306
     protocol: TCP
     targetPort: 3306
+  - name: cluster
+    port: 4444
+  - name: ist
+    port: 4567
+  - name: sst
+    port: 4568
   - name: agent
     port: 5555
     protocol: TCP
@@ -59,6 +71,12 @@ spec:
     port: 3306
     protocol: TCP
     targetPort: 3306
+  - name: cluster
+    port: 4444
+  - name: ist
+    port: 4567
+  - name: sst
+    port: 4568
   - name: agent
     port: 5555
     protocol: TCP
@@ -83,6 +101,12 @@ spec:
     port: 3306
     protocol: TCP
     targetPort: 3306
+  - name: cluster
+    port: 4444
+  - name: ist
+    port: 4567
+  - name: sst
+    port: 4568
   - name: agent
     port: 5555
     protocol: TCP
