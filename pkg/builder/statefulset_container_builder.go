@@ -363,48 +363,48 @@ func buildContainer(image string, pullPolicy corev1.PullPolicy, tpl *mariadbv1al
 }
 
 func mariadbLivenessProbe(mariadb *mariadbv1alpha1.MariaDB) *corev1.Probe {
-	return nil
+	return mariadbProbe(mariadb, mariadb.Spec.LivenessProbe)
 }
 
 func mariadbReadinessProbe(mariadb *mariadbv1alpha1.MariaDB) *corev1.Probe {
 	return nil
 }
 
-// func mariadbProbe(mariadb *mariadbv1alpha1.MariaDB, probe *corev1.Probe) *corev1.Probe {
-// 	if mariadb.Replication().Enabled && ptr.Deref(mariadb.Replication().ProbesEnabled, false) {
-// 		replProbe := mariadbReplProbe(mariadb, probe)
-// 		setProbeThresholds(replProbe, probe)
-// 		return replProbe
-// 	}
-// 	if mariadb.Galera().Enabled {
-// 		galerProbe := *galeraStsProbe
-// 		setProbeThresholds(&galerProbe, probe)
-// 		return &galerProbe
-// 	}
-// 	if probe != nil {
-// 		return probe
-// 	}
-// 	return &defaultStsProbe
-// }
+func mariadbProbe(mariadb *mariadbv1alpha1.MariaDB, probe *corev1.Probe) *corev1.Probe {
+	if mariadb.Replication().Enabled && ptr.Deref(mariadb.Replication().ProbesEnabled, false) {
+		replProbe := mariadbReplProbe(mariadb, probe)
+		setProbeThresholds(replProbe, probe)
+		return replProbe
+	}
+	if mariadb.Galera().Enabled {
+		galerProbe := *galeraStsProbe
+		setProbeThresholds(&galerProbe, probe)
+		return &galerProbe
+	}
+	if probe != nil {
+		return probe
+	}
+	return &defaultStsProbe
+}
 
-// func mariadbReplProbe(mariadb *mariadbv1alpha1.MariaDB, probe *corev1.Probe) *corev1.Probe {
-// 	mxsProbe := &corev1.Probe{
-// 		ProbeHandler: corev1.ProbeHandler{
-// 			Exec: &corev1.ExecAction{
-// 				Command: []string{
-// 					"bash",
-// 					"-c",
-// 					fmt.Sprintf("%s/%s", ProbesMountPath, mariadb.ReplConfigMapKeyRef().Key),
-// 				},
-// 			},
-// 		},
-// 		InitialDelaySeconds: 40,
-// 		TimeoutSeconds:      5,
-// 		PeriodSeconds:       10,
-// 	}
-// 	setProbeThresholds(mxsProbe, probe)
-// 	return mxsProbe
-// }
+func mariadbReplProbe(mariadb *mariadbv1alpha1.MariaDB, probe *corev1.Probe) *corev1.Probe {
+	mxsProbe := &corev1.Probe{
+		ProbeHandler: corev1.ProbeHandler{
+			Exec: &corev1.ExecAction{
+				Command: []string{
+					"bash",
+					"-c",
+					fmt.Sprintf("%s/%s", ProbesMountPath, mariadb.ReplConfigMapKeyRef().Key),
+				},
+			},
+		},
+		InitialDelaySeconds: 40,
+		TimeoutSeconds:      5,
+		PeriodSeconds:       10,
+	}
+	setProbeThresholds(mxsProbe, probe)
+	return mxsProbe
+}
 
 func maxscaleProbe(mxs *mariadbv1alpha1.MaxScale, probe *corev1.Probe) *corev1.Probe {
 	if probe != nil {
@@ -423,46 +423,46 @@ func maxscaleProbe(mxs *mariadbv1alpha1.MaxScale, probe *corev1.Probe) *corev1.P
 	}
 }
 
-// func setProbeThresholds(source, target *corev1.Probe) {
-// 	if target == nil {
-// 		return
-// 	}
-// 	source.InitialDelaySeconds = target.InitialDelaySeconds
-// 	source.TimeoutSeconds = target.TimeoutSeconds
-// 	source.PeriodSeconds = target.PeriodSeconds
-// 	source.SuccessThreshold = target.SuccessThreshold
-// 	source.FailureThreshold = target.FailureThreshold
-// }
+func setProbeThresholds(source, target *corev1.Probe) {
+	if target == nil {
+		return
+	}
+	source.InitialDelaySeconds = target.InitialDelaySeconds
+	source.TimeoutSeconds = target.TimeoutSeconds
+	source.PeriodSeconds = target.PeriodSeconds
+	source.SuccessThreshold = target.SuccessThreshold
+	source.FailureThreshold = target.FailureThreshold
+}
 
 var (
-	// defaultStsProbe = corev1.Probe{
-	// 	ProbeHandler: corev1.ProbeHandler{
-	// 		Exec: &corev1.ExecAction{
-	// 			Command: []string{
-	// 				"bash",
-	// 				"-c",
-	// 				"mariadb -u root -p\"${MARIADB_ROOT_PASSWORD}\" -e \"SELECT 1;\"",
-	// 			},
-	// 		},
-	// 	},
-	// 	InitialDelaySeconds: 20,
-	// 	TimeoutSeconds:      5,
-	// 	PeriodSeconds:       10,
-	// }
-	// galeraStsProbe = &corev1.Probe{
-	// 	ProbeHandler: corev1.ProbeHandler{
-	// 		Exec: &corev1.ExecAction{
-	// 			Command: []string{
-	// 				"bash",
-	// 				"-c",
-	// 				"mariadb -u root -p\"${MARIADB_ROOT_PASSWORD}\" -e \"SHOW STATUS LIKE 'wsrep_ready'\" | grep -c ON ",
-	// 			},
-	// 		},
-	// 	},
-	// 	InitialDelaySeconds: 60,
-	// 	TimeoutSeconds:      5,
-	// 	PeriodSeconds:       30,
-	// }
+	defaultStsProbe = corev1.Probe{
+		ProbeHandler: corev1.ProbeHandler{
+			Exec: &corev1.ExecAction{
+				Command: []string{
+					"bash",
+					"-c",
+					"mariadb -u root -p\"${MARIADB_ROOT_PASSWORD}\" -e \"SELECT 1;\"",
+				},
+			},
+		},
+		InitialDelaySeconds: 20,
+		TimeoutSeconds:      5,
+		PeriodSeconds:       10,
+	}
+	galeraStsProbe = &corev1.Probe{
+		ProbeHandler: corev1.ProbeHandler{
+			Exec: &corev1.ExecAction{
+				Command: []string{
+					"bash",
+					"-c",
+					"mariadb -u root -p\"${MARIADB_ROOT_PASSWORD}\" -e \"SHOW STATUS LIKE 'wsrep_ready'\" | grep -c ON ",
+				},
+			},
+		},
+		InitialDelaySeconds: 60,
+		TimeoutSeconds:      5,
+		PeriodSeconds:       30,
+	}
 	defaultAgentProbe = func(galera mariadbv1alpha1.Galera) *corev1.Probe {
 		return &corev1.Probe{
 			ProbeHandler: corev1.ProbeHandler{
