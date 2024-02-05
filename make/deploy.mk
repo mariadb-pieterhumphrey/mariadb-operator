@@ -1,5 +1,5 @@
 HELM_DIR ?= deploy/charts/mariadb-operator
-CLUSTER ?= mdb
+CLUSTER ?= mdb-galera
 
 ##@ Cluster
 

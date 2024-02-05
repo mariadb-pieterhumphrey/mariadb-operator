@@ -38,7 +38,7 @@ spec:
       podRecoveryTimeout: 5m
       podSyncTimeout: 5m
     initContainer:
-      image: ghcr.io/mariadb-operator/init:v0.0.14
+      image: ghcr.io/mariadb-operator/init:v0.0.13
     volumeClaimTemplate:
       resources:
         requests:
@@ -95,18 +95,10 @@ spec:
   updateStrategy:
     type: RollingUpdate
 
-  myCnf: |
-    [mariadb]
-    bind-address=*
-    default_storage_engine=InnoDB
-    binlog_format=row
-    innodb_autoinc_lock_mode=2
-    max_allowed_packet=256M
-
   resources:
     requests:
-      cpu: 100m
-      memory: 128Mi
+      cpu: 1
+      memory: 512Mi
     limits:
       memory: 1Gi
 
